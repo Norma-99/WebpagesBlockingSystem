@@ -2,19 +2,20 @@ import pandas as pd
 import numpy as np
 import pickle
 import partition
+import requests
 import os
 import socket
 import re 
 import whois
-import requests
+import string
+import math
 
 from urllib.parse import urlparse, parse_qs
+
 from pycountry_convert import country_alpha2_to_continent_code, country_name_to_country_alpha2
 from ip2geotools.databases.noncommercial import DbIpCity
-from tld import get_tld
 from bs4 import BeautifulSoup
-import string
-# from org.jsoup import Jsoup
+from tld import get_tld
 
 class Preprocessing:
     ### Helping functions
@@ -159,12 +160,37 @@ class SamplePreprocessing:
     def __init__(self, url:str):
         self.url = url
     
+    # IP address 
+    def get_ip(self):
+        p_url = urlparse(self.url).netloc
+        return socket.gethostbyname(p_url) 
+
+    def tld (self):
+        return get_tld(self.url, fail_silently=True)
+
+    # HTTPS
+    def get_parsed_url (self):
+        return urlparse(self.url)
+
+    def is_http (self):
+        parsed = self.get_parsed_url()
+        return parsed.scheme
+
+    # Continent
+    def country2continent (self, country):
+        if country != 'Unknown':
+            return country_alpha2_to_continent_code(country)
+        return country
+
+    def get_continent(self):
+        try: 
+            response = DbIpCity.get(self.ip_addr, api_key='free')
+            return country2continent(response.country)
+        except: 
+            return 'unknown'
+    
+    # Content
     def get_content(self):
-        """
-        comm = "wget -O out.html " + self.url
-        os.system(comm)
-        with open("out.html", "r", encoding="latin-1") as out:
-            return out.read()"""
         try:
             r = requests.get(self.url)
             soup = BeautifulSoup(r.content, 'html.parser')
@@ -177,117 +203,122 @@ class SamplePreprocessing:
         except:
             return "ERROR"
 
-    def get_ip(self):
-        p_url = urlparse(self.url).netloc
-        return socket.gethostbyname(p_url) 
-
-    
-    def get_js_len_inKB(self): #Function for computing 'js_len from Web Content
-        #js=re.findall(r'(?s)(<script)(.*?)(</script>)', self.content)
-        #js=re.findall(r'(?s)(<span class="screen-reader-text">)(.*?)(</span>)',content)
+    # Filtered content length in KBytes
+    def get_js_len_inKB(self):
         if self.content == "ERROR":
-            return 1000
+            return 10000000
         js = ''.join(str(j) for j in self.content)
-        return len(js.encode('utf-8'))/100
-        
-    def get_whois (self):
-        query = whois.whois(self.url)
-        domain = query.registrar
-        if len(str(domain)) > 1 :
-            return 0.0
-        else: 
-            return 1.0
+        return len(js.encode('utf-8'))/1000
 
-    def get_parsed_url (self):
-        return urlparse(self.url)
+    # Entropy
+    def get_entropy(self):
+        string = self.url.strip()
+        prob = [float(string.count(c)) / len(string) for c in dict.fromkeys(list(string))]
+        entropy = sum([(p * math.log(p) / math.log(2.0)) for p in prob])
+        return entropy
 
-    def is_http (self):
-        parsed = self.get_parsed_url()
-        return parsed.scheme
+    # URL length
+    def get_url_len (self):
+        return len(self.url) 
 
+    # URL body or host length --> DNS length
     def get_body_len (self):
         parsed = self.get_parsed_url()
         return len(parsed.netloc)
 
+    # URL number of attributes
     def get_num_args (self):
         parsed = self.get_parsed_url()
         params = parse_qs(parsed.query)
         path_components = list(filter(bool, parsed.path.split('/')))
         return len(path_components) + len(list(params))
     
+    # URL path length
+    def get_path_len (self):
+        parsed = self.get_parsed_url()
+        return len(parsed.path)
+
+    # URL letters length
+    def get_letter_count (self):
+        letters = 0
+        for i in self.url:
+            if i.isalpha():
+                letters = letters + 1
+        return letters
+
+    # URL digits length (numbers and symbols)
+    def get_digits_len (self):
+        digits = 0 
+        for i in self.url:
+            if i.isnumeric():
+                digits = digits + 1
+            if i in string.punctuation:
+                digits = digits + 1
+        return digits
+
+    # Convert IP address to numeric 
     def address_to_numeric(self):
         nums = self.ip.split('.')
         address_num = 0
         for offset in range(0, 4):
             address_num += int(nums[offset]) << (8 * (3 - offset))
         return address_num
-    
-    def country2continent (self, country):
-        if country != 'Unknown':
-            return country_alpha2_to_continent_code(country)
-        return country
 
-    def get_continent(self):
-        response = DbIpCity.get(self.ip, api_key='free')
-        return self.country2continent(response.country)
-
+    # Main preprocessing
     def preprocess(self):
-        self.content = self.get_content() 
+
         self.ip = self.get_ip()
 
-        # Create dataframe from the recieved data
-        self.df = pd.DataFrame(data={'url': [self.url], 'ip_add': [self.ip], 'content': [self.content]})
-        print(self.url)
-        print(self.ip)
-        # get url_length 
-        self.df['url_len'] = self.df['url'].str.len()
+        self.df = pd.DataFrame(data={'url': [self.url], 'ip_addr': [self.ip]})
 
-        # Get js_length
-        self.df['js_len'] = self.get_js_len_inKB()
+        self.df['tld'] = self.tld()
 
-        # Get who_is attribute
-        self.df['who_is'] = self.get_whois()
+        Preprocessing().to_num(self.df, 'is_com', 'tld', 'com')
 
-        # Get if the URL is http or https
         self.df['https'] = self.is_http()
 
-        Preprocessing().to_num(self.df, 'https', 'https', 'https')
+        Preprocessing().to_num(self.df, 'https', 'https', 'https') 
 
-        # Get the URL body length
+        con_loc = self.get_continent()
+
+        self.df['continent'] = con_loc
+
+        for i in ['na', 'eu', 'oc', 'af', 'as', 'sa', 'unknown']:
+            self.df[i] = 0
+
+        Preprocessing().to_one_hot(self.df, 'continent', {'?'})
+
+        self.content = self.get_content() 
+
+        self.df['content'] = self.content
+
+        self.df['js_len'] = self.get_js_len_inKB()
+
+        self.df['entropy'] = self.get_entropy()
+
+        self.df['url_len'] = self.get_url_len()
+
         self.df['url_body_len'] = self.get_body_len()
 
-        # Get the number of arguments in the URL
         self.df['url_num_args'] = self.get_num_args()
 
-        del self.df['url']
+        self.df['url_path_len'] = self.get_path_len()
 
-        # Transform the IP address to a 32 bit sequence
+        self.df['url_letters_len'] = self.get_letter_count()
+
+        self.df['url_digit_len'] = self.get_digits_len()
+
         self.df['numeric_address'] = self.address_to_numeric()
 
         for bit in range(0, 32):
             self.df[f'address_bit{bit}'] = self.df['numeric_address'] & (1 << bit) != 0
             self.df[f'address_bit{bit}'] = self.df[f'address_bit{bit}'].astype(int)
 
-        # Get continent from URL
-        con_loc = self.get_continent()
-        self.df['con_loc'] = con_loc
-
-        for i in ['na', 'eu', 'oc', 'af', 'as', 'sa']:
-            self.df[i] = 0
-
-        Preprocessing().to_one_hot(self.df, 'con_loc', {'?'})
-
-        # Get if the Top Level Domain of the URL is .com or not
-        self.df['tld'] = get_tld(self.url)
-        Preprocessing().to_num(self.df, 'is_com', 'tld', 'com')
-
-        del self.df['tld']
-
         # Delete unused DF columns
         print(self.df['numeric_address'])
-        del self.df['ip_add'], self.df['numeric_address'], self.df['content']
+        del self.df['url'], self.df['ip_add'], self.df['tld'], self.df['numeric_address'], self.df['content']
 
-        # Normalize every column
+        # Normalize every column --> FALTA CAMBIAR ESTO
         for col in self.df: 
             self.df[col] = self.df[col].astype(float)
             if col == 'js_len':
